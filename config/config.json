@@ -1,0 +1,104 @@
+{
+  "robot": {
+    "name": "小陪",
+    "version": "1.0.0",
+    "id": "robot_001"
+  },
+  "hardware": {
+    "camera": {
+      "enabled": true,
+      "resolution": "1080p",
+      "fps": 30,
+      "device_id": 0
+    },
+    "microphone": {
+      "enabled": true,
+      "sample_rate": 16000,
+      "channels": 4
+    },
+    "speaker": {
+      "enabled": true,
+      "volume": 70
+    },
+    "display": {
+      "enabled": true,
+      "width": 800,
+      "height": 480
+    },
+    "motors": {
+      "enabled": true,
+      "max_speed": 0.5,
+      "acceleration": 0.2
+    }
+  },
+  "modules": {
+    "emotion": {
+      "enabled": true,
+      "wake_word": "小陪",
+      "speech_recognition_language": "zh-CN"
+    },
+    "vision": {
+      "enabled": true,
+      "face_recognition_enabled": true,
+      "scene_understanding_enabled": true,
+      "motion_tracking_enabled": true,
+      "behavior_analysis_enabled": true
+    },
+    "life": {
+      "enabled": true,
+      "schedule_reminder_enabled": true,
+      "health_monitoring_enabled": true,
+      "medication_reminder_enabled": true,
+      "emergency_assistance_enabled": true
+    },
+    "monitor": {
+      "enabled": true,
+      "real_time_video_enabled": true,
+      "two_way_audio_enabled": true,
+      "anomaly_alarm_enabled": true,
+      "video_recording_enabled": true,
+      "video_quality": "720p",
+      "video_bitrate": 2048
+    },
+    "entertainment": {
+      "enabled": true,
+      "story_enabled": true,
+      "music_enabled": true,
+      "game_enabled": true,
+      "photo_enabled": true
+    },
+    "home": {
+      "enabled": true,
+      "device_control_enabled": true,
+      "environment_monitoring_enabled": true,
+      "scene_mode_enabled": true
+    }
+  },
+  "network": {
+    "wifi": {
+      "ssid": "",
+      "password": ""
+    },
+    "mqtt": {
+      "broker": "localhost",
+      "port": 1883,
+      "username": "",
+      "password": ""
+    },
+    "api": {
+      "endpoint": "http://localhost:5000",
+      "token": ""
+    }
+  },
+  "security": {
+    "encryption_enabled": true,
+    "encryption_key": "",
+    "privacy_mode_enabled": false
+  },
+  "logging": {
+    "level": "INFO",
+    "file_path": "robot.log",
+    "max_size": 10485760,
+    "backup_count": 5
+  }
+}

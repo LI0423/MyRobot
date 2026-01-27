@@ -1,0 +1,4 @@
+sensor_msgs/msg/Image image
+---
+vision_msgs/msg/FaceDetection face
+bool success

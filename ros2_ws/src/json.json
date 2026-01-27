@@ -1,0 +1,65 @@
+{
+  "user_id": "93946c9f-7079-4e57-a559-10d0e5917df6",
+  "export_time": "2026-01-27T16:09:50.564174",
+  "data": {
+    "profile": {
+      "user_id": "93946c9f-7079-4e57-a559-10d0e5917df6",
+      "name": "测试用户",
+      "age": 31,
+      "gender": "男",
+      "relationship": "主人",
+      "created_at": "2026-01-27T16:09:50.546478",
+      "updated_at": "2026-01-27T16:09:50.546483"
+    },
+    "preferences": [
+      {
+        "user_id": "93946c9f-7079-4e57-a559-10d0e5917df6",
+        "category": "娱乐",
+        "key": "音乐类型",
+        "value": "古典音乐",
+        "created_at": "2026-01-27T16:09:50.560151",
+        "updated_at": "2026-01-27T16:09:50.560152"
+      },
+      {
+        "user_id": "93946c9f-7079-4e57-a559-10d0e5917df6",
+        "category": "饮食",
+        "key": "喜欢的食物",
+        "value": "川菜",
+        "created_at": "2026-01-27T16:09:50.560570",
+        "updated_at": "2026-01-27T16:09:50.560570"
+      }
+    ],
+    "calendar_events": [
+      {
+        "event_id": "57c4124b-16bc-4830-bcea-f762a52d637f",
+        "user_id": "93946c9f-7079-4e57-a559-10d0e5917df6",
+        "title": "更新后的测试会议",
+        "start_time": "2026-01-28T16:09:50.561685",
+        "end_time": "2026-01-28T17:09:50.561689",
+        "recurrence": null,
+        "reminder": {
+          "minutes": 30,
+          "method": "notification"
+        },
+        "description": "这是一个测试会议",
+        "created_at": "2026-01-27T16:09:50.561694",
+        "updated_at": "2026-01-27T16:09:50.561695"
+      },
+      {
+        "event_id": "bec01270-19fc-4a81-9284-760f0215f596",
+        "user_id": "93946c9f-7079-4e57-a559-10d0e5917df6",
+        "title": "即将到来的测试事件",
+        "start_time": "2026-01-27T17:09:50.563320",
+        "end_time": null,
+        "recurrence": null,
+        "reminder": {
+          "minutes": 30,
+          "method": "notification"
+        },
+        "description": null,
+        "created_at": "2026-01-27T16:09:50.563323",
+        "updated_at": "2026-01-27T16:09:50.563323"
+      }
+    ]
+  }
+}

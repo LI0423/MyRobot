@@ -1,0 +1,6 @@
+sensor_msgs/msg/Image image
+bool return_image
+---
+sensor_msgs/msg/Image annotated_image
+vision_msgs/msg/ObjectDetection[] objects
+bool success
