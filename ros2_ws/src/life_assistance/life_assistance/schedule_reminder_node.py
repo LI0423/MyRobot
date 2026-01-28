@@ -37,12 +37,17 @@ class ScheduleReminderNode(Node):
         self.config = {
             "schedule_reminder_enabled": True,
             "health_monitoring_enabled": True,
-            "medication_reminder_enabled": True
+            "medication_reminder_enabled": True,
+            "emergency_contact": "13800000000" # 示例紧急联系人
         }
         
         # 发布提醒话题
         self.reminder_publisher = self.create_publisher(
             String, 'schedule_reminder', 10)
+        
+        # 发布紧急求助话题
+        self.sos_publisher = self.create_publisher(
+            String, 'emergency_sos', 10)
         
         # 订阅 clock 话题
         self.clock_subscriber = self.create_subscription(
@@ -57,6 +62,9 @@ class ScheduleReminderNode(Node):
         
         # 初始化闹钟列表
         self.alarms = []
+        
+        # 初始化用药提醒列表
+        self.medication_reminders = []
         
         # 初始化当前时间
         self.current_time = datetime.now()
@@ -91,6 +99,9 @@ class ScheduleReminderNode(Node):
             # 初始化用药提醒
             self._init_medication_reminder()
             
+            # 初始化紧急求助
+            self._init_emergency()
+            
             # 初始化完成
             self.status = "运行中"
             self.logger.info(f"{self.name}初始化完成！")
@@ -113,7 +124,19 @@ class ScheduleReminderNode(Node):
     def _init_medication_reminder(self):
         """初始化用药提醒"""
         self.logger.info("初始化用药提醒...")
-        # TODO: 实现用药提醒初始化逻辑
+        # 示例：添加一个默认的用药提醒（如果列表为空）
+        if not self.medication_reminders:
+            morning_time = datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
+            if morning_time < datetime.now():
+                morning_time += timedelta(days=1)
+            
+            self.add_medication_reminder(morning_time, "降压药")
+            self.logger.info(f"已添加示例用药提醒: {morning_time.strftime('%Y-%m-%d %H:%M')} 吃降压药")
+
+    def _init_emergency(self):
+        """初始化紧急求助"""
+        self.logger.info("初始化紧急求助...")
+        # 可以在这里检查SOS硬件按钮状态等
     
     def voice_command_callback(self, msg):
         """处理 voice_command 话题的回调
@@ -132,6 +155,36 @@ class ScheduleReminderNode(Node):
             self.logger.warning(f"语音指令置信度低 ({confidence})，忽略")
             return
         
+        # 处理 SOS 指令
+        if "SOS" in command or "救命" in command or "紧急" in command:
+            self.trigger_sos(f"语音触发: {command}")
+            return
+            
+        # 处理 ALARM_STOP 指令
+        if command == "ALARM_STOP":
+            self.stop_all_alerts()
+            return
+
+        # 处理结构化指令 (适配 XiaoZhi 节点发来的 params)
+        if command.startswith("set_medication:"):
+            # set_medication:time:medicine_name
+            try:
+                parts = command.split(":")
+                time_str = parts[1] # HHMM
+                medicine = parts[2] if len(parts) > 2 else "药物"
+                
+                now = datetime.now()
+                hour = int(time_str[:2])
+                minute = int(time_str[2:])
+                target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if target_time < now:
+                    target_time += timedelta(days=1)
+                
+                self.add_medication_reminder(target_time, medicine)
+            except Exception as e:
+                self.logger.error(f"解析用药指令失败: {e}")
+            return
+
         # 解析语音指令，提取闹钟时间信息
         alarm_time = self.parse_alarm_time(command)
         if alarm_time:
@@ -240,9 +293,36 @@ class ScheduleReminderNode(Node):
         reminder_msg.data = f"闹钟设置成功！时间: {alarm_time.strftime('%Y-%m-%d %H:%M')}"
         self.reminder_publisher.publish(reminder_msg)
         self.logger.info(f"闹钟设置成功！时间: {alarm_time.strftime('%Y-%m-%d %H:%M')}")
-    
+        
+    def add_medication_reminder(self, time, medicine_name):
+        """添加用药提醒"""
+        reminder = {
+            "id": len(self.medication_reminders) + 1,
+            "time": time,
+            "medicine": medicine_name,
+            "triggered": False
+        }
+        self.medication_reminders.append(reminder)
+        self.logger.info(f"添加用药提醒: {time} - {medicine_name}")
+        
+        msg = String()
+        msg.data = f"已设置用药提醒: {time.strftime('%H:%M')} 服用 {medicine_name}"
+        self.reminder_publisher.publish(msg)
+
+    def trigger_sos(self, reason="未知原因"):
+        """触发紧急求助 (SOS)"""
+        self.logger.warning(f"触发SOS！原因: {reason}")
+        
+        # 发布SOS消息
+        msg = String()
+        msg.data = f"SOS! 原因: {reason}, 联系人: {self.config['emergency_contact']}"
+        self.sos_publisher.publish(msg)
+        self.reminder_publisher.publish(msg) # 同时在提醒话题发布以便语音播报
+        
+        # TODO: 这里可以添加发送短信、拨打电话或推送到云端的逻辑
+
     def check_alarms(self):
-        """检查是否有闹钟需要触发"""
+        """检查是否有闹钟或提醒需要触发"""
         if self.status != "运行中":
             return
         
@@ -250,15 +330,20 @@ class ScheduleReminderNode(Node):
             # 获取当前时间
             now = datetime.now()
             
-            # 遍历闹钟列表，检查是否有闹钟需要触发
+            # 1. 检查闹钟
             for alarm in self.alarms:
                 if not alarm["triggered"] and now >= alarm["time"]:
-                    # 触发闹钟
                     self.trigger_alarm(alarm)
-                    # 标记为已触发
                     alarm["triggered"] = True
+            
+            # 2. 检查用药提醒
+            for reminder in self.medication_reminders:
+                if not reminder["triggered"] and now >= reminder["time"]:
+                    self.trigger_medication_reminder(reminder)
+                    reminder["triggered"] = True
+                    
         except Exception as e:
-            self.logger.error(f"检查闹钟时发生错误: {str(e)}")
+            self.logger.error(f"检查闹钟/提醒时发生错误: {str(e)}")
     
     def trigger_alarm(self, alarm):
         """触发闹钟
@@ -271,7 +356,14 @@ class ScheduleReminderNode(Node):
         reminder_msg.data = f"闹钟响了！设置时间: {alarm['time'].strftime('%Y-%m-%d %H:%M')}"
         self.reminder_publisher.publish(reminder_msg)
         self.logger.info(f"闹钟触发！时间: {alarm['time'].strftime('%Y-%m-%d %H:%M')}")
-    
+
+    def trigger_medication_reminder(self, reminder):
+        """触发用药提醒"""
+        msg = String()
+        msg.data = f"到了服药时间！请服用: {reminder['medicine']}"
+        self.reminder_publisher.publish(msg)
+        self.logger.info(f"触发用药提醒: {reminder}")
+
     def check_schedule(self):
         """检查日程"""
         if self.status != "运行中":
@@ -283,7 +375,7 @@ class ScheduleReminderNode(Node):
             self.logger.info("检查日程...")
             # TODO: 实现实际的日程检查逻辑
             
-            # 检查闹钟
+            # 检查闹钟 (timer每分钟触发一次，但clock_callback也每秒触发check_alarms，双重保险)
             self.check_alarms()
             
         except Exception as e:
@@ -305,11 +397,7 @@ class ScheduleReminderNode(Node):
             return False
     
     def get_alarms(self):
-        """获取当前的闹钟列表
-        
-        Returns:
-            list: 闹钟列表
-        """
+        """获取当前的闹钟列表"""
         return self.alarms
     
     def get_status(self):
@@ -318,8 +406,17 @@ class ScheduleReminderNode(Node):
             "name": self.name,
             "status": self.status,
             "config": self.config,
-            "alarms_count": len(self.alarms)
+            "alarms_count": len(self.alarms),
+            "medication_reminders": len(self.medication_reminders)
         }
+    
+    def stop_all_alerts(self):
+        """停止所有正在响铃的提醒"""
+        self.logger.info("收到停止闹钟指令，停止所有响铃...")
+        # TODO: 实际停止播放音频或蜂鸣器的逻辑
+        stop_msg = String()
+        stop_msg.data = "STOP_ALARM"
+        self.reminder_publisher.publish(stop_msg)
     
     def stop(self):
         """停止生活辅助模块"""
@@ -337,6 +434,7 @@ class ScheduleReminderNode(Node):
             
             # 清空闹钟列表
             self.alarms.clear()
+            self.medication_reminders.clear()
             
             self.status = "已停止"
             self.logger.info(f"{self.name}已停止")

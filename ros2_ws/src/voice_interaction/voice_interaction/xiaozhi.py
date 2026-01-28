@@ -2,12 +2,22 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
+# 尝试导入语音消息类型，如果失败则使用String
+try:
+    from voice_msgs.msg import VoiceCommand
+    VOICE_MSGS_AVAILABLE = True
+except ImportError:
+    VOICE_MSGS_AVAILABLE = False
+    print("Warning: voice_msgs not found, VoiceCommand integration will be limited.")
+
 import threading
 import warnings
 import urllib3
 import logging
 import os
 import time
+import re
+from datetime import datetime
 
 from llm_node.mqtt_service import MQTTService
 from llm_node.audio_service import AudioService
@@ -69,6 +79,9 @@ class XiaoZhiNode(Node):
         # 初始化配置
         self.config = Config()
         
+        # 初始化ROS发布者
+        self._init_publishers()
+        
         # 初始化MQTT服务
         logger.debug("正在初始化MQTT服务...")
         self.mqtt_service = MQTTService(self.config)
@@ -94,6 +107,21 @@ class XiaoZhiNode(Node):
         self.lock = threading.Lock()  # 线程锁
         self.last_listen_stop_time = None  # 上次监听停止时间
         logger.info("小智节点初始化完成")
+
+    def _init_publishers(self):
+        """初始化ROS发布者"""
+        # 家居控制命令发布者
+        self.home_control_pub = self.create_publisher(
+            String, 'home_control_command', 10)
+        
+        # 语音指令发布者 (用于生活辅助等)
+        if VOICE_MSGS_AVAILABLE:
+            self.voice_command_pub = self.create_publisher(
+                VoiceCommand, 'voice_command', 10)
+        else:
+            self.voice_command_pub = None
+            
+        logger.info("ROS发布者初始化完成")
         
     def _start_mqtt_and_audio(self):
         """启动MQTT和音频服务"""
@@ -284,9 +312,185 @@ class XiaoZhiNode(Node):
         if llm_text and llm_text != self.last_printed_text:
             logger.info(f'LLM回复: {llm_text}')
             self.last_printed_text = llm_text
+            
+            # 解析并执行指令
+            self.parse_and_execute_command(llm_text)
         else:
             logger.debug('LLM文本与上次相同，跳过更新')
         logger.info('LLM消息处理完成')
+        
+    def _init_publishers(self):
+        # Home control command publisher
+        self.home_control_pub = self.create_publisher(
+            String, 'home_control_command', 10)
+        
+        # Voice command publisher (for life assistance, etc.)
+        if VOICE_MSGS_AVAILABLE:
+            self.voice_command_pub = self.create_publisher(
+                VoiceCommand, 'voice_command', 10)
+        else:
+            self.voice_command_pub = None
+
+        # [NEW] Motion Control Publisher
+        self.motion_pub = self.create_publisher(
+            String, 'motion_command', 10)
+
+        # [NEW] System Control Publisher
+        self.system_pub = self.create_publisher(
+            String, 'system_command', 10)
+
+        # [NEW] Media Control Publisher
+        self.media_pub = self.create_publisher(
+            String, 'media_command', 10)
+            
+        logger.info("ROS发布者初始化完成")
+
+    def parse_and_execute_command(self, text):
+        """解析并执行指令"""
+        if not text:
+            return
+
+        # 1. 尝试解析 [INTENT:ID:SLOTS] 格式 (新标准)
+        # Regex to match [INTENT:ID:SLOTS]
+        # ID might contain underscores, e.g. SAFETY_STOP
+        intent_matches = re.findall(r'\[INTENT:([A-Za-z0-9_]+):?(.*?)\]', text)
+        if intent_matches:
+            for intent_id, slots in intent_matches:
+                self._execute_intent(intent_id, slots)
+            return
+
+        # 2. 尝试解析 [CMD:domain:action:params] 格式 (旧标准, 兼容)
+        matches = re.findall(r'\[CMD:(.*?)\]', text)
+        for match in matches:
+            try:
+                logger.info(f"解析到指令: {match}")
+                parts = match.split(':')
+                if len(parts) >= 2:
+                    domain = parts[0]
+                    action = parts[1]
+                    params = ':'.join(parts[2:]) if len(parts) > 2 else ""
+                    
+                    if domain == "home":
+                        self._execute_home_command(action, params)
+                    elif domain == "life":
+                        self._execute_life_command(action, params)
+                    else:
+                        logger.warning(f"未知指令域: {domain}")
+            except Exception as e:
+                logger.error(f"指令执行失败: {match}, 错误: {e}")
+
+    def _execute_intent(self, intent_id, slots):
+        """执行意图指令"""
+        logger.info(f"执行意图: {intent_id}, 槽位: {slots}")
+        
+        # 紧急安全
+        if intent_id.startswith("SAFETY_"):
+            if intent_id == "SAFETY_SOS":
+                # 同时触发本地报警和Life Assistance的SOS流程
+                self._execute_life_command("sos", "")
+            else:
+                self.motion_pub.publish(String(data=intent_id))
+        
+        # 运动控制
+        elif intent_id.startswith("MOVE_"):
+            self.motion_pub.publish(String(data=intent_id))
+            
+        # 音量/媒体
+        elif intent_id.startswith("VOL_") or intent_id.startswith("MEDIA_"):
+            # 将槽位与ID组合发送，如 VOL_UP:20
+            command_data = f"{intent_id}:{slots}" if slots else intent_id
+            self.media_pub.publish(String(data=command_data))
+            
+        # 工具助手 (Time/Date 直接本地回复)
+        elif intent_id == "TIME_QUERY":
+            now_time = datetime.now().strftime("%p %I点%M分").replace("AM", "上午").replace("PM", "下午")
+            self.mqtt_service.publish_tts(f"现在是{now_time}")
+            
+        elif intent_id == "DATE_QUERY":
+            weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+            now = datetime.now()
+            date_str = now.strftime("%m月%d日")
+            weekday = weekdays[now.weekday()]
+            self.mqtt_service.publish_tts(f"今天是{date_str}，{weekday}")
+            
+        elif intent_id == "ALARM_STOP":
+            # 发送给 Life Assistance
+            if self.voice_command_pub:
+                 msg = VoiceCommand()
+                 msg.command = "ALARM_STOP"
+                 msg.language = "cmd"
+                 msg.confidence = 1.0
+                 self.voice_command_pub.publish(msg)
+
+        # 系统控制
+        elif intent_id.startswith("SYS_") or intent_id == "NET_CONFIG":
+            self.system_pub.publish(String(data=intent_id))
+            
+        else:
+            logger.warning(f"未处理的意图: {intent_id}")
+
+    def _execute_home_command(self, action, params):
+        """执行家居控制指令"""
+        # 构造 control_device:<device_id>:<command>:<value> 格式
+        # 假设 params 格式为 device_id:value 或者只是 device_id (默认 value)
+        
+        device_id = ""
+        value = "default"
+        
+        # 简单解析 params
+        param_parts = params.split(':')
+        if len(param_parts) >= 1:
+            device_id = param_parts[0]
+        if len(param_parts) >= 2:
+            value = param_parts[1]
+            
+        command_str = f"control_device:{device_id}:{action}:{value}"
+        
+        msg = String()
+        msg.data = command_str
+        self.home_control_pub.publish(msg)
+        logger.info(f"已发布家居控制指令: {command_str}")
+
+    def _execute_life_command(self, action, params):
+        """执行生活辅助指令"""
+        if not self.voice_command_pub:
+            logger.warning("VoiceCommand publisher unavailable")
+            return
+
+        final_command = params
+        
+        # 1. 设置用药提醒
+        if action == "set_medication":
+            # format: set_medication:0800:降压药
+            # params 可能是 0800:降压药
+            final_command = f"set_medication:{params}"
+            
+        # 2. 触发SOS
+        elif action == "sos":
+            final_command = "触发SOS"
+            
+        # 3. 设置闹钟 (兼容旧逻辑)
+        elif action == "set_alarm":
+             if "tomorrow" in params:
+                 time_part = params.replace("tomorrow_", "")
+                 if len(time_part) == 4:
+                     hour = time_part[0:2]
+                     minute = time_part[2:4]
+                     final_command = f"明天{hour}点{minute}分设置闹钟"
+             elif "today" in params:
+                 time_part = params.replace("today_", "")
+                 if len(time_part) == 4:
+                     hour = time_part[0:2]
+                     minute = time_part[2:4]
+                     final_command = f"{hour}点{minute}分设置闹钟"
+        
+        msg = VoiceCommand()
+        msg.command = final_command
+        msg.language = "zh-CN"
+        msg.confidence = 1.0  # LLM生成的指令置信度设为最高
+        
+        self.voice_command_pub.publish(msg)
+        logger.info(f"已发布语音指令: {final_command}")
             
     def handle_goodbye_message(self, message):
         """处理GOODBYE消息，用于结束会话
