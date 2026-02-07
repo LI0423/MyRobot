@@ -1,0 +1,36 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: myrobot-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+
+  alarm-mcp-server:
+    build:
+      context: ../..
+      dockerfile: deploy/mcp/Dockerfile
+    container_name: myrobot-alarm-mcp
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    env_file:
+      - ./.env
+    environment:
+      MCP_MQTT_HOST: ${MCP_MQTT_HOST:-mosquitto}
+      MCP_MQTT_PORT: ${MCP_MQTT_PORT:-1883}
+      MCP_MQTT_USERNAME: ${MCP_MQTT_USERNAME:-}
+      MCP_MQTT_PASSWORD: ${MCP_MQTT_PASSWORD:-}
+      MCP_CALL_TOPIC_TEMPLATE: ${MCP_CALL_TOPIC_TEMPLATE:-robot/{device_id}/tool_call}
+      MCP_RESULT_TOPIC_TEMPLATE: ${MCP_RESULT_TOPIC_TEMPLATE:-robot/{device_id}/tool_result}
+      MCP_HEARTBEAT_TOPIC_TEMPLATE: ${MCP_HEARTBEAT_TOPIC_TEMPLATE:-robot/{device_id}/heartbeat}
+      MCP_TOOL_TIMEOUT_SEC: ${MCP_TOOL_TIMEOUT_SEC:-15}
+      MCP_DEVICE_OFFLINE_TIMEOUT_SEC: ${MCP_DEVICE_OFFLINE_TIMEOUT_SEC:-45}
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:
