@@ -1,55 +1,76 @@
 import threading
 import socket
-import collections
-import pyaudio
 import time
 import opuslib
 import os
 import logging
-from llm_node.utils import aes_ctr_encrypt, aes_ctr_decrypt
+from enum import Enum
 from llm_node.config import Config
-from llm_node.vad_detector import VADDetector, VadEvent
-from llm_node.wake_word_detector import WakeWordDetector
+from llm_node.vad_detector import VADDetector
+from llm_node.integrated_wake_detector import IntegratedWakeWordDetector
+from llm_node.audio_device_manager import AudioDeviceManager
+from llm_node.udp_audio_transport import UdpAudioTransport
+from llm_node.recorder_session import RecorderSession
 
-os.environ['DISPLAY'] = ':0'
 
 logger = logging.getLogger(__name__)
 
-class ALSAErrorSuppressor:
-    """ALSA错误输出抑制器，防止音频库错误信息干扰用户界面"""
 
-    def __enter__(self):
-        """进入上下文管理器，将stderr重定向到/dev/null"""
-        self.old_stderr = os.dup(2)  # 保存原始stderr文件描述符
-        self.devnull = os.open('/dev/null', os.O_WRONLY)  # 打开/dev/null用于写入
-        os.dup2(self.devnull, 2)  # 将stderr重定向到/dev/null
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """退出上下文管理器，恢复原始stderr"""
-        os.dup2(self.old_stderr, 2)  # 恢复原始stderr
-        os.close(self.old_stderr)  # 关闭保存的文件描述符
-        os.close(self.devnull)  # 关闭/dev/null文件描述符
+class AudioState(Enum):
+    """音频服务状态枚举"""
+    IDLE = "idle"                    # 唤醒词监听中
+    RESPONDING = "responding"        # 播放唤醒回应中
+    RECORDING = "recording"          # 录音中
+    UPLOADING = "uploading"          # 上传语音中
+    WAITING = "waiting"              # 等待服务器响应
+    PLAYING_TTS = "playing_tts"      # 播放TTS回复中
 
 
 class AudioService:
-    """音频服务类，负责处理音频的采集、编码、加密、发送和接收、解密、解码、播放"""
+    """音频服务类 - 简化版架构
+    
+    核心特点:
+    - 麦克风始终保持打开 (16kHz)，避免设备状态问题
+    - 原生 16kHz 录音，无需降采样，提高唤醒准确率和上传音质
+    - 状态机控制流程，但不频繁开关设备
+    """
 
     def __init__(self, config: Config, on_listen_start=None, on_listen_stop=None, on_wake_word_detected=None):
-        """初始化音频服务
-        
-        Args:
-            config (Config): 配置对象，包含音频相关配置
-            on_listen_start (callable): 监听开始回调函数
-            on_listen_stop (callable): 监听停止回调函数
-            on_wake_word_detected (callable): 唤醒词检测回调函数
-        """
+        """初始化音频服务"""
         self.config = config
-        self.on_listen_start = on_listen_start  # 监听开始回调
-        self.on_listen_stop = on_listen_stop    # 监听停止回调
-        self.on_wake_word_detected = on_wake_word_detected  # 唤醒词检测回调
+        self.on_listen_start = on_listen_start
+        self.on_listen_stop = on_listen_stop
+        self.on_wake_word_detected = on_wake_word_detected
 
-        # 初始化VAD检测器
+        # ========== 状态机 ==========
+        self._state = AudioState.IDLE
+        self._state_lock = threading.Lock()
+        
+        # ========== 常量定义 (消除硬编码) ==========
+        # 帧时长: 60ms
+        self.frame_duration_ms = config.frame_duration
+        # 帧样本数: 16000 * 0.06 = 960
+        self.frame_samples = int(self.config.sample_rate * self.frame_duration_ms / 1000)
+        # 帧字节数: 960 * 2 (16-bit) = 1920
+        self.frame_bytes = self.frame_samples * 2
+        
+        # ========== 录音会话配置 ==========
+        self._max_recording_sec = 30
+        self._max_buffer_frames = int(self._max_recording_sec * config.sample_rate / self.frame_samples)
+        self._no_speech_timeout = 10
+        
+        # ========== 等待状态超时 ==========
+        self._waiting_start_time = 0
+        self._waiting_timeout = 30  # 等待服务器响应的最大时间（秒）
+        
+        # ========== 唤醒词检测器 (16kHz) ==========
+        self.wake_word_detector = IntegratedWakeWordDetector(
+            model_dir=config.sherpa_model_dir,
+            keywords_file=config.sherpa_keywords_file,
+            sample_rate=config.sample_rate
+        )
+        
+        # ========== VAD 检测器 (16kHz) ==========
         self.vad = VADDetector(
             sample_rate=config.sample_rate,
             frame_ms=config.vad_frame_ms,
@@ -58,522 +79,479 @@ class AudioService:
             end_silence_ms=config.vad_end_silence_ms,
             pre_roll_ms=config.vad_pre_roll_ms
         )
-        
-        # 初始化唤醒词检测器
-        self.wake_word_detector = WakeWordDetector(
+        self.recorder = RecorderSession(
+            vad=self.vad,
             sample_rate=config.sample_rate,
-            frame_ms=config.vad_frame_ms,
-            wake_word="小智"
+            vad_frame_ms=config.vad_frame_ms,
+            max_buffer_frames=self._max_buffer_frames,
+            no_speech_timeout=self._no_speech_timeout,
+            pre_roll_frames=15
         )
         
-        # 唤醒状态标志
-        self.is_wake_word_detected = False
+        # ========== ALSA 设备 ==========
+        # 60ms @ 16kHz = 960样本
+        # VAD分割 = 3个 20ms 帧 (3 * 320 = 960) - 完美匹配
+        self.device_manager = AudioDeviceManager(
+            sample_rate=self.config.sample_rate,
+            frame_samples=self.frame_samples,
+            mic_device=self.config.mic_device,
+            spk_device=self.config.spk_device,
+            mic_period_size=self.frame_samples
+        )
         
-        # 音频播放标志
-        self.is_playing = False
-        # 音频设备和流
-        self.audio = None              # PyAudio对象
-        self.spk_stream = None         # 扬声器输出流
-        self.mic_stream = None         # 麦克风输入流
-        # 线程
-        self.send_thread = None        # 音频发送线程
-        self.recv_thread = None        # 音频接收线程
-        # 状态标志
-        self.running = False           # 服务运行状态
-        # 网络相关
-        self.udp_socket = None         # UDP套接字
-        self.lock = threading.Lock()   # 线程锁，保护共享资源
-        # 编码器配置
-        self.encoder_rate = config.sample_rate                      # 编码器采样率
-        self.encoder_frame_ms = config.encoder_frame_ms              # 编码器帧长度（毫秒）
-        self.encoder_frame_samples = int(self.encoder_rate * self.encoder_frame_ms / 1000)  # 每帧样本数
-        # 音频帧配置
-        self.frame_samples = int(self.encoder_rate * config.vad_frame_ms / 1000)  # 每帧样本数（基于VAD帧大小）
-        self.frames_per_packet = max(1, self.encoder_frame_samples // self.frame_samples)  # 每个数据包包含的帧数
-        # 会话和UDP配置
-        self.session_id = None         # 会话ID
-        self.udp_info = config.aes_opus_info['udp']
+        # ========== 网络 ==========
+        self.lock = threading.Lock()
         self.audio_params = config.aes_opus_info['audio_params']
-        self.local_sequence = 0        # 本地序列计数器
+        self.transport = UdpAudioTransport(config.aes_opus_info['udp'])
         
+        # ========== Opus 编解码器 ==========
+        self._encoder = None
+        self._decoder = None
+        
+        # ========== 线程 ==========
+        self._main_thread = None
+        self._recv_thread = None
+        self.running = False
+        
+        # ========== 会话 ==========
+        self.session_id = None
+    
+
+    
+    @property
+    def state(self):
+        """获取当前状态"""
+        with self._state_lock:
+            return self._state
+    
+    def _set_state(self, new_state: AudioState):
+        """设置新状态"""
+        with self._state_lock:
+            old_state = self._state
+            self._state = new_state
+            logger.info(f"状态转换: {old_state.value} → {new_state.value}")
+
+    def _set_state_if(self, expected_state: AudioState, new_state: AudioState):
+        """条件状态迁移: 仅当当前状态等于 expected_state 时才迁移。"""
+        with self._state_lock:
+            if self._state != expected_state:
+                return False
+            old_state = self._state
+            self._state = new_state
+            logger.info(f"状态转换: {old_state.value} → {new_state.value}")
+            return True
+    
     def update_udp_info(self, udp_dict):
-        """更新UDP配置信息
-        
-        Args:
-            udp_dict (dict): 包含UDP配置的字典
-        """
+        """更新UDP配置信息"""
+        self.transport.update_udp_info(udp_dict)
+    
+    def update_audio_params(self, audio_params_dict):
+        """更新音频参数信息（用于 TTS 播放）"""
         with self.lock:
-            self.udp_info.update(udp_dict)
+            requested_sample_rate = audio_params_dict.get('sample_rate')
+            current_sample_rate = self.audio_params.get('sample_rate')
+
+            # 运行中采样率切换时，同步重建 decoder，保证参数与解码器一致
+            if (
+                requested_sample_rate is not None
+                and requested_sample_rate != current_sample_rate
+                and self._decoder is not None
+            ):
+                try:
+                    self._decoder = opuslib.Decoder(requested_sample_rate, 1)
+                    logger.info(f"Decoder 已重建: sample_rate={requested_sample_rate}")
+                except Exception as e:
+                    logger.error(f"重建 Decoder 失败，放弃本次音频参数更新: {e}")
+                    return
+
+            self.audio_params.update(audio_params_dict)
+            logger.info(f"音频参数已更新: sample_rate={self.audio_params.get('sample_rate')}")
+    
+    # ========== 服务启动/停止 ==========
     
     def start(self):
         """启动音频服务"""
-        logger.info('正在启动音频服务...')
+        logger.info('启动音频服务...')
         if self.running:
-            logger.warning('音频服务已在运行，跳过启动')
             return
         
+        # 初始化 UDP (不使用 connect()，因为服务器可能从不同端口响应)
         try:
-            # 初始化PyAudio和音频流
-            logger.debug('初始化PyAudio...')
-            with ALSAErrorSuppressor():
-                self.audio = pyaudio.PyAudio()
-            logger.info('PyAudio初始化完成')
-            
-            logger.debug('打开麦克风流...')
-            logger.debug(f'音频参数: 采样率={self.config.sample_rate}, 格式=paInt16, 声道=1')
-            # 使用卡片1的设备（duplex-audio ES8326 HiFi），并抑制ALSA错误
-            with ALSAErrorSuppressor():
-                self.mic_stream = self.audio.open(
-                    format=pyaudio.paInt16,
-                    channels=1, 
-                    rate=self.config.sample_rate,   
-                    input=True, 
-                    frames_per_buffer=960,
-                    input_device_index=1
-                )
-            logger.info('麦克风流打开完成')
+            self.transport.create_socket(timeout=1.0, reset_sequence=True)
+            server, port = self.transport.target()
+            logger.info(f"UDP socket 已创建，目标: {server}:{port}")
         except Exception as e:
-            logger.error(f"Failed to start audio stream: {e}")
+            logger.error(f"UDP 初始化失败: {e}")
             return
         
-        with self.lock:
-            try:
-                # 初始化UDP套接字
-                logger.debug('初始化UDP套接字...')
-                server = self.udp_info['server']
-                port = self.udp_info['port']
-                logger.info(f'连接到UDP服务器: {server}:{port}')
-                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                self.udp_socket.settimeout(1.0)
-                self.udp_socket.connect((server, port))
-                logger.info(f'成功连接到UDP服务器: {server}:{port}')
-            except Exception as e:
-                logger.error(f"Failed to connect to UDP server: {e}")
-                return
+        # 打开麦克风 (始终保持打开)
+        if not self.device_manager.open_mic():
+            logger.error("无法打开麦克风，服务启动失败")
+            self.transport.close_socket()
+            return
+        
+        # 初始化编解码器
+        self._encoder = opuslib.Encoder(self.config.sample_rate, 1, opuslib.APPLICATION_AUDIO)
+        self._decoder = opuslib.Decoder(self.audio_params['sample_rate'], 1)
         
         self.running = True
+        self._set_state(AudioState.IDLE)
         
-        # 启动音频发送线程
-        logger.debug('启动音频发送线程...')
-        self.send_thread = threading.Thread(target=self._send_audio, daemon=True, name="audio_send_thread")
-        self.send_thread.start()
-        logger.info('音频发送线程启动完成')
+        # 启动主线程 (状态机循环)
+        self._main_thread = threading.Thread(target=self._main_loop, daemon=True, name="audio_main")
+        self._main_thread.start()
         
-        # 启动音频接收线程
-        logger.debug('启动音频接收线程...')
-        self.recv_thread = threading.Thread(target=self._recv_audio, daemon=True, name="audio_recv_thread")
-        self.recv_thread.start()
-        logger.info('音频接收线程启动完成')
+        # 启动接收线程
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True, name="audio_recv")
+        self._recv_thread.start()
         
-        logger.info("Audio service started")
+        logger.info("音频服务已启动")
     
     def stop(self):
         """停止音频服务"""
-        logger.info('正在停止音频服务...')
+        logger.info('停止音频服务...')
         self.running = False
         
-        # 等待发送线程结束
-        if self.send_thread:
-            logger.debug('等待音频发送线程结束...')
-            self.send_thread.join(timeout=2.0)
-            logger.info('音频发送线程已结束')
+        if self._main_thread:
+            self._main_thread.join(timeout=2.0)
+        if self._recv_thread:
+            self._recv_thread.join(timeout=2.0)
         
-        # 等待接收线程结束
-        if self.recv_thread:
-            logger.debug('等待音频接收线程结束...')
-            self.recv_thread.join(timeout=2.0)
-            logger.info('音频接收线程已结束')
+        self.device_manager.close_all()
         
-        # 关闭麦克风流
-        if self.mic_stream:
-            logger.debug('关闭麦克风流...')
-            try:
-                self.mic_stream.stop_stream()
-                self.mic_stream.close()
-                logger.info('麦克风流已关闭')
-            except Exception as e:
-                logger.error(f"Failed to close mic stream: {e}")
+        self.transport.close_socket()
         
-        # 关闭扬声器流
-        if self.spk_stream:
-            logger.debug('关闭扬声器流...')
-            try:
-                self.spk_stream.stop_stream()
-                self.spk_stream.close()
-                logger.info('扬声器流已关闭')
-            except Exception as e:
-                logger.error(f"Failed to close speaker stream: {e}")
-        
-        # 关闭PyAudio
-        if self.audio:
-            logger.debug('关闭PyAudio...')
-            try:
-                self.audio.terminate()
-                logger.info('PyAudio已关闭')
-            except Exception as e:
-                logger.error(f"Failed to terminate PyAudio: {e}")
-        
-        # 关闭UDP套接字
-        if self.udp_socket:
-            logger.debug('关闭UDP套接字...')
-            try:
-                self.udp_socket.close()
-                logger.info('UDP套接字已关闭')
-            except Exception as e:
-                logger.error(f"Failed to close UDP socket: {e}")
-        
-        logger.info("Audio service stopped")
+        logger.info("音频服务已停止")
     
     def restart_audio_streams(self):
-        """重启音频流"""
-        logger.info("正在重启音频流...")
+        """重启音频流 (UDP 重连)
         
-        # 停止当前的运行状态
-        old_running = self.running
-        self.running = False
-        
-        # 等待现有线程结束
-        if self.send_thread and self.send_thread.is_alive():
-            logger.debug("等待音频发送线程结束...")
-            self.send_thread.join(timeout=2.0)
-        if self.recv_thread and self.recv_thread.is_alive():
-            logger.debug("等待音频接收线程结束...")
-            self.recv_thread.join(timeout=2.0)
-        
-        # 关闭麦克风流
-        if self.mic_stream:
-            try:
-                self.mic_stream.stop_stream()
-                self.mic_stream.close()
-                self.mic_stream = None
-                logger.debug("麦克风流已关闭")
-            except Exception as e:
-                logger.error(f"关闭麦克风流失败: {str(e)}")
-        
-        # 关闭扬声器流
-        if self.spk_stream:
-            try:
-                self.spk_stream.stop_stream()
-                self.spk_stream.close()
-                self.spk_stream = None
-                logger.debug("扬声器流已关闭")
-            except Exception as e:
-                logger.error(f"关闭扬声器流失败: {str(e)}")
-        
-        # 清理现有UDP连接
-        if self.udp_socket:
-            try:
-                self.udp_socket.close()
-                self.udp_socket = None
-                logger.debug("UDP套接字已关闭")
-            except Exception as e:
-                logger.error(f"关闭UDP套接字失败: {str(e)}")
-        
-        try:
-            # 重新初始化麦克风流
-            with ALSAErrorSuppressor():
-                self.mic_stream = self.audio.open(
-                    format=pyaudio.paInt16,
-                    channels=1, 
-                    rate=self.config.sample_rate,   
-                    input=True, 
-                    frames_per_buffer=960,
-                    input_device_index=1
-                )
-            logger.debug("麦克风流已重新初始化")
-            
-            # 创建新的UDP连接
-            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.udp_socket.settimeout(1.0)
-            self.udp_socket.connect((self.udp_info['server'], self.udp_info['port']))
-            logger.debug("UDP连接已重建")
-            
-            # 恢复运行状态
-            self.running = old_running
-            
-            # 重置VAD检测器
-            self.vad.reset()
-            
-            # 启动音频发送线程
-            self.send_thread = threading.Thread(target=self._send_audio, daemon=True, name="audio_send_thread")
-            self.send_thread.start()
-            logger.debug("音频发送线程已重启")
-            
-            # 启动音频接收线程
-            self.recv_thread = threading.Thread(target=self._recv_audio, daemon=True, name="audio_recv_thread")
-            self.recv_thread.start()
-            logger.debug("音频接收线程已重启")
-            
-            logger.info("音频流重启完成")
-        except Exception as e:
-            logger.error(f"重启音频流失败: {str(e)}")
-            self.running = old_running
-    
-    def _init_speaker_stream(self):
-        """初始化扬声器流，确保扬声器可用"""
-        if self.spk_stream is None:
-            try:
-                logger.debug("初始化扬声器流")
-                with ALSAErrorSuppressor():
-                    # 使用48000Hz采样率，与麦克风一致
-                    self.spk_stream = self.audio.open(
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=48000,
-                        output=True,
-                        frames_per_buffer=960,
-                        stream_callback=None,
-                        start=True
-                    )
-                logger.info("扬声器流初始化完成")
-                # 预填充静音数据减少延迟
-                silence = b'\x00' * (960 * 2)  # 48ms静音
-                self.spk_stream.write(silence)
-            except Exception as e:
-                logger.error(f"初始化扬声器流失败: {str(e)}")
-                self.spk_stream = None
-    
-    def _play_voice_response(self, response_text="在呢"):
-        """播放语音回应
-        
-        Args:
-            response_text (str): 要播放的文本回应，默认为"在呢"
+        不使用 connect()，因为服务器可能从不同端口响应
         """
+        logger.info("重启音频流...")
         try:
-            logger.info(f"🔊 播放语音回应: {response_text}")
-            
-            # 重新初始化扬声器流，确保可用
-            if self.spk_stream:
-                try:
-                    self.spk_stream.close()
-                except Exception as e:
-                    logger.error(f"关闭扬声器流失败: {str(e)}")
-                self.spk_stream = None
-            
-            # 初始化扬声器流
-            self._init_speaker_stream()
-            
-            # 生成简单的音频信号作为回应（实际应用中应替换为TTS）
-            # 生成440Hz的正弦波，持续200ms
-            if self.spk_stream:
-                import numpy as np
-                sample_rate = 48000
-                duration = 0.2  # 200ms
-                frequency = 440  # 440Hz，A4音
-                
-                # 生成正弦波
-                t = np.linspace(0, duration, int(sample_rate * duration), False)
-                sine_wave = np.sin(2 * np.pi * frequency * t).astype(np.float32)
-                
-                # 将正弦波转换为PCM16格式
-                pcm_data = (sine_wave * 32767).astype(np.int16)
-                
-                # 确保扬声器流正在运行
-                if not self.spk_stream.is_active():
-                    self.spk_stream.start_stream()
-                
-                # 播放音频
-                self.spk_stream.write(pcm_data.tobytes())
-                logger.debug("语音回应播放完成")
+            self.transport.create_socket(timeout=1.0, reset_sequence=False)
+            server, port = self.transport.target()
+            logger.info(f"UDP socket 已创建，目标: {server}:{port}")
         except Exception as e:
-            logger.error(f"播放语音回应失败: {str(e)}")
+            logger.error(f"UDP 重连失败: {e}")
     
-    def _send_audio(self):
-        """音频发送线程，负责采集、编码、加密和发送音频数据"""
-        nonce = self.udp_info['nonce']
-        # 初始化Opus编码器
-        encoder = opuslib.Encoder(self.config.sample_rate, 1, opuslib.APPLICATION_VOIP)
-        frames = collections.deque()
-        # 重置VAD检测器和唤醒词检测器
-        self.vad.reset()
-        self.wake_word_detector.reset()
+    # ========== 状态机主循环 ==========
+    
+    def _main_loop(self):
+        """状态机主循环"""
+        logger.info("状态机主循环启动")
         
-        try:
-            while self.running:
-                # 读取音频数据
-                # 960个样本 * 2字节/样本 = 1920字节
-                # 48000Hz采样率下，960个样本 = 20ms，这是WebRTC VAD支持的帧大小
-                data = self.mic_stream.read(960, exception_on_overflow=False)
-                
-                # 唤醒词检测 - 始终运行，即使在播放音频或处理用户语音时
-                # 确保系统持续监听唤醒词，随时可以被唤醒
-                wake_detected = self.wake_word_detector.feed(data)
-                if wake_detected:
-                    logger.info("🎉 检测到唤醒词'小智'，中断当前音频，开始录音")
-                    self.is_wake_word_detected = True
-                    
-                    # 停止当前的音频播放（如果正在播放）
-                    if self.spk_stream:
-                        try:
-                            self.spk_stream.stop_stream()
-                            logger.debug("已停止当前音频播放")
-                        except Exception as e:
-                            logger.error(f"停止音频播放失败: {str(e)}")
-                    
-                    # 触发唤醒词回调
-                    if self.on_wake_word_detected:
-                        self.on_wake_word_detected()
-                    
-                    # 播放唤醒回应"在呢"
-                    self._play_voice_response("在呢")
-                    
-                    # 重置VAD检测器，开始新的语音检测
-                    self.vad.reset()
-                    
-                    # 重置VAD检测状态，确保能检测到新的语音开始
-                    logger.info("🔄 重置VAD检测器，准备新的语音检测")
-                    
-                    # 清空之前的音频队列，开始新的录音
-                    frames.clear()
-                    continue
-                
-                # 唤醒词已检测到，进行正常的VAD检测和音频处理
-                if self.is_wake_word_detected:
-                    # VAD检测
-                    event = self.vad.feed(data)
-                    
-                    if event == VadEvent.START:
-                        # 检测到语音开始
-                        logger.info("🎤 VAD检测到语音开始")
-                        if self.on_listen_start:
-                            self.on_listen_start()
-                        
-                        # 获取预滚缓冲区中的音频
-                        pre_roll_frames = self.vad.get_pre_roll()
-                        logger.debug(f"🎤 预滚缓冲区音频帧数: {len(pre_roll_frames)}")
-                        for frame in pre_roll_frames:
-                            frames.append(frame)
-                    elif event == VadEvent.END:
-                        # 检测到语音结束
-                        logger.info("🎤 VAD检测到语音结束")
-                        if self.on_listen_stop:
-                            self.on_listen_stop()
-                        # 重置唤醒词检测状态，等待下次唤醒
-                        # 但保持唤醒词检测器运行，持续监听
-                        logger.info("🔄 重置唤醒状态，继续监听唤醒词")
-                        self.is_wake_word_detected = False
-                        self.wake_word_detector.reset()
-                        self.vad.reset()
-                
-                # 将当前帧添加到队列（仅当唤醒词已检测到）
-                if self.is_wake_word_detected:
-                    frames.append(data)
-                    # 当队列中的帧数达到一个数据包所需的帧数时，发送数据
-                    if len(frames) >= self.frames_per_packet:
-                        # 取出一个数据包所需的帧数
-                        packet_frames = [frames.popleft() for _ in range(min(self.frames_per_packet, len(frames)))]
-                        
-                        # 合并为一个数据包
-                        pcm_data = b''.join(packet_frames)
-                        # 使用Opus编码音频数据
-                        opus_data = encoder.encode(pcm_data, 960)
-                        self.local_sequence += 1
-                        new_nonce = (nonce[0:4] + format(len(opus_data), '04x') +
-                                    nonce[8:24] + format(self.local_sequence, '08x')) 
-                        # 使用AES-CTR加密音频数据
-                        encrypted_data = aes_ctr_encrypt(bytes.fromhex(self.udp_info['key']), 
-                                                        bytes.fromhex(new_nonce), 
-                                                        opus_data)
-                        # 构建数据包
-                        packet = bytes.fromhex(new_nonce) + encrypted_data
-                        # 发送数据包
-                        with self.lock:
-                            try:
-                                self.udp_socket.sendto(packet, (self.udp_info['server'], self.udp_info['port']))
-                            except Exception as e:
-                                if e.errno == errno.ENETUNREACH:
-                                    self.restart_audio_streams()
-                                    break
-                                elif e.errno == errno.EBADF:  # Bad file descriptor - socket已关闭
-                                    logger.info("UDP socket已关闭，停止发送")
-                                    break
-                                else:
-                                    raise        
-        except Exception as e:
-            # 如果程序正在退出，只记录日志，不打印错误
-            if self.running:
-                logger.error(f"音频发送错误: {str(e)}")
+        while self.running:
+            current_state = self.state
+            
+            if current_state == AudioState.IDLE:
+                self._handle_idle_state()
+            elif current_state == AudioState.RESPONDING:
+                self._handle_responding_state()
+            elif current_state == AudioState.RECORDING:
+                # 默认使用批量模式
+                # 如需流式上传，请在此处改为 self._handle_recording_state_streaming()
+                self._handle_recording_state()
+            elif current_state == AudioState.UPLOADING:
+                self._handle_uploading_state()
+            elif current_state == AudioState.WAITING:
+                self._handle_waiting_state()
+            elif current_state == AudioState.PLAYING_TTS:
+                self._handle_playing_tts_state()
             else:
-                logger.info(f"程序退出时音频发送停止: {str(e)}")
-        finally:
-            if self.mic_stream is not None:
-                try:
-                    self.mic_stream.stop_stream()
-                    self.mic_stream.close()
-                except:
-                    pass
-    
-    def _recv_audio(self):
-        """音频接收线程 - 接收服务器音频并播放"""
+                time.sleep(0.1)
         
-        key = bytes.fromhex(self.udp_info['key'])
-        sample_rate = self.audio_params['sample_rate']
-        frame_duration = self.audio_params['frame_duration']
-        frame_num = int(frame_duration / (1000 / sample_rate))
-        # 创建Opus解码器
-        decoder = opuslib.Decoder(sample_rate, 1)
+        logger.info("状态机主循环退出")
+    
+    def _handle_idle_state(self):
+        """IDLE 状态: 唤醒词监听
+        
+        麦克风始终保持打开 (48kHz)，读取后降采样给唤醒词检测器
+        """
+        length, data = self.device_manager.read_mic()
+        if length <= 0:
+            if length < 0:
+                time.sleep(0.1)
+            return
+        
+        # 唤醒词检测 (直接使用 16kHz 原生数据)
+        try:
+            wake_detected = self.wake_word_detector.feed_audio(data)
+            if wake_detected:
+                logger.info("检测到唤醒词!")
+                
+                # 触发回调
+                if self.on_wake_word_detected:
+                    self.on_wake_word_detected()
+                
+                self._set_state(AudioState.RESPONDING)
+        except Exception as e:
+            logger.error(f"唤醒词检测错误: {e}")
+    
+    def _handle_responding_state(self):
+        """RESPONDING 状态: 播放唤醒回应
+        
+        注意：麦克风保持打开，但数据会被丢弃（避免录到回放）
+        """
+        logger.info("播放唤醒回应...")
+        
+        # 打开扬声器
+        if not self.device_manager.open_spk(rate=self.config.sample_rate):
+            self.recorder.reset_for_new_recording()
+            self._set_state(AudioState.RECORDING)
+            return
+
+        # 增加等待时间，让回声消散
+        time.sleep(0.3)
+        
+        # 15 * 60ms = 900ms，足以覆盖回放时间和回声
+        for _ in range(15):
+            self.device_manager.read_mic()
+        
+        # 进入录音状态
+        self.recorder.reset_for_new_recording()
+        self._set_state(AudioState.RECORDING)
+        logger.info("开始等待用户说话...")
+    
+    def _send_audio_frame(self, frame_data):
+        """发送单帧音频 (16kHz, 60ms)"""
+        try:
+            # 1. 检查帧大小 (16kHz * 60ms * 2bytes = 1920 bytes)
+            if len(frame_data) != self.frame_bytes:
+                return
+            
+            # 2. Opus 编码
+            opus_data = self._encoder.encode(frame_data, self.frame_samples)
+            
+            # 3. 交给传输层执行加密和 UDP 发送
+            self.transport.send_opus(opus_data)
+            
+        except Exception as e:
+            logger.error(f"发送音频帧失败: {e}")
+    
+    def _handle_recording_state(self):
+        """RECORDING 状态: 录音 (默认 - 批量模式)
+        
+        麦克风读取 60ms 帧 (960 样本 @ 16kHz)
+        缓冲直到录音结束，然后转入 UPLOADING 状态
+        """
+        length, data = self.device_manager.read_mic()
+        if length <= 0:
+            if length < 0:
+                time.sleep(0.1)
+            return
+        
+        result = self.recorder.process_frame(data)
+
+        if result["listen_started"]:
+            logger.info("VAD 检测到语音开始")
+            if self.on_listen_start:
+                self.on_listen_start()
+
+        if result["end_detected"]:
+            logger.info(f"录音结束，共 {self.recorder.frame_count()} 帧")
+            self._set_state(AudioState.UPLOADING)
+        elif result["no_speech_timeout"]:
+            logger.warning(f"等待语音超时 ({self._no_speech_timeout}秒)，返回 IDLE")
+            self._set_state(AudioState.IDLE)
+        elif result["max_duration"]:
+            logger.warning("录音超时，强制结束")
+            self._set_state(AudioState.UPLOADING)
+
+    def _handle_recording_state_streaming(self):
+        """RECORDING 状态: 录音 (可选 - 流式模式)
+        
+        开启方法：在 _main_loop 中将 _handle_recording_state 替换为此方法
+        特点：实时发送录音帧，延迟更低
+        """
+        length, data = self.device_manager.read_mic()
+        if length <= 0:
+            if length < 0:
+                time.sleep(0.1)
+            return
+
+        result = self.recorder.process_frame(data)
+
+        if result["listen_started"]:
+            logger.info("VAD 检测到语音开始 (Streaming模式)")
+            if self.on_listen_start:
+                self.on_listen_start()
+
+        for frame in result["new_frames"]:
+            self._send_audio_frame(frame)
+
+        if result["end_detected"]:
+            logger.info(f"录音结束 (Streaming完成)，共 {self.recorder.frame_count()} 帧")
+            if self.on_listen_stop:
+                self.on_listen_stop()
+            self._set_state(AudioState.WAITING)
+        elif result["no_speech_timeout"]:
+            logger.warning(f"等待语音超时 ({self._no_speech_timeout}秒)，返回 IDLE")
+            self._set_state(AudioState.IDLE)
+        elif result["max_duration"]:
+            logger.warning("录音超时，强制结束")
+            if self.on_listen_stop:
+                self.on_listen_stop()
+            self._set_state(AudioState.WAITING)
+    
+    def _handle_uploading_state(self):
+        """UPLOADING 状态: 批量上传录音 (批量模式专用)"""
+        frame_list = self.recorder.pop_audio_buffer()
+        logger.info(f"开始上传 {len(frame_list)} 帧音频...")
+        
+        if not frame_list:
+            logger.warning("录音缓冲区为空")
+            self._waiting_start_time = time.time()
+            self._set_state(AudioState.WAITING)
+            return
         
         try:
-            while self.running:
-                # 确保扬声器流已初始化并正在运行
-                if self.spk_stream is None:
-                    # 使用指定采样率打开扬声器
-                    with ALSAErrorSuppressor():
-                        self.spk_stream = self.audio.open(
-                            format=pyaudio.paInt16,
-                            channels=1,
-                            rate=sample_rate,
-                            output=True,
-                            frames_per_buffer=frame_num,
-                            stream_callback=None, 
-                            start=False
-                        )
-                    
-                    if self.spk_stream is None:
-                        logger.error("无法打开音频播放设备")
-                        time.sleep(1)
+            for frame in frame_list:
+                # 复用发送逻辑，但需要加上时序控制
+                self._send_audio_frame(frame)
+                
+                # 模拟实时发送 (60ms 一帧)
+                time.sleep(self.frame_duration_ms / 1000.0)
+            
+            logger.info("音频上传完成")
+            
+            # 上传完成后，告诉服务器"我说完了"
+            if self.on_listen_stop:
+                self.on_listen_stop()
+                
+        except Exception as e:
+            logger.error(f"上传失败: {e}")
+        
+        self._waiting_start_time = time.time()
+        self._set_state(AudioState.WAITING)
+    
+    def _handle_waiting_state(self):
+        """WAITING 状态: 等待服务器响应
+        
+        继续读取麦克风（丢弃数据），保持设备活跃
+        如果超时则返回 IDLE
+        """
+        self.device_manager.read_mic()  # 读取并丢弃
+        
+        # 检查等待超时
+        if time.time() - self._waiting_start_time > self._waiting_timeout:
+            logger.warning(f"等待服务器响应超时 ({self._waiting_timeout}秒)，返回 IDLE")
+            self.wake_word_detector.reset()
+            self._set_state_if(AudioState.WAITING, AudioState.IDLE)
+            return
+        
+        time.sleep(0.01)
+    
+    def _handle_playing_tts_state(self):
+        """PLAYING_TTS 状态: 播放 TTS 回复
+        
+        继续读取麦克风（丢弃数据），检测打断
+        """
+        length, data = self.device_manager.read_mic()
+        if length > 0:
+            # 检测唤醒词（可用于打断）
+            if self.wake_word_detector.feed_audio(data):
+                logger.info("TTS 播放被唤醒词打断")
+                self.device_manager.close_spk()
+                self.wake_word_detector.reset()
+                self._set_state(AudioState.RESPONDING)
+        time.sleep(0.01)
+    
+    # ========== 接收线程 ==========
+    
+    def _recv_loop(self):
+        """音频接收线程"""
+        logger.info("接收线程启动")
+        
+        tts_buffer = []  # 用于存储接收到的 TTS 音频数据
+        
+        while self.running:
+            current_state = self.state
+            if current_state not in (AudioState.WAITING, AudioState.PLAYING_TTS):
+                time.sleep(0.05)
+                continue
+            
+            # 每次循环读取最新的 UDP 配置（可能被 HELLO 响应更新）
+            try:
+                with self.lock:
+                    sample_rate = self.audio_params['sample_rate']
+                    frame_duration = self.audio_params['frame_duration']
+                    decoder = self._decoder
+                frame_num = int(frame_duration / (1000 / sample_rate))
+                if decoder is None:
+                    logger.warning("Decoder 未初始化，跳过本次接收帧")
+                    time.sleep(0.05)
+                    continue
+            except Exception as e:
+                logger.error(f"读取 UDP 配置失败: {e}")
+                time.sleep(0.1)
+                continue
+            
+            try:
+                decrypt_data, addr = self.transport.recv_decrypted(bufsize=4096)
+                logger.debug(f"收到 UDP 数据，来自 {addr}")
+                
+                if current_state == AudioState.WAITING:
+                    switched = self._set_state_if(AudioState.WAITING, AudioState.PLAYING_TTS)
+                    if not switched:
+                        logger.debug("收到 UDP 包但状态已变化，丢弃该包")
+                        continue
+
+                    logger.info("收到服务器响应，开始播放 TTS")
+                    # 播放长音频时，增加超时时间以容忍网络抖动
+                    self.transport.set_timeout(2.0)
+                    tts_buffer = []  # 开始新的 TTS 播放，清空缓冲区
+                    if not self.device_manager.open_spk(rate=sample_rate):
+                        self._set_state_if(AudioState.PLAYING_TTS, AudioState.WAITING)
                         continue
                 
-                try:
-                    # 接收加密音频数据
-                    data, _ = self.udp_socket.recvfrom(4096)
-                    split_nonce = data[:16]
-                    encrypt_data = data[16:]
-                    # 解密音频数据
-                    decrypt_data = aes_ctr_decrypt(key, split_nonce, encrypt_data)
+                # 解码
+                pcm_data = decoder.decode(decrypt_data, frame_num)
+                
+                self.device_manager.write_spk(pcm_data)
+                
+                # 收集音频数据用于保存
+                tts_buffer.append(pcm_data)
                     
-                    # 确保扬声器流正在运行
-                    if not self.spk_stream.is_active():
-                        # 预填充静音数据减少延迟
-                        silence = b'\x00' * (frame_num * 2)
-                        self.spk_stream.start_stream()
-                        self.spk_stream.write(silence)
-                        logger.debug("已重新启动扬声器流")
+            except socket.timeout:
+                if self.state == AudioState.PLAYING_TTS:
+                    logger.info("TTS 播放完成")
                     
-                    # 播放音频
-                    self.spk_stream.write(decoder.decode(decrypt_data, frame_num))
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    logger.error(f"音频接收错误: {str(e)}")
-                    # 如果是流已关闭的错误，重置扬声器流
-                    if "Stream closed" in str(e) or "Bad file descriptor" in str(e):
-                        logger.debug("重置扬声器流")
-                        try:
-                            self.spk_stream.close()
-                            self.spk_stream = None
-                        except Exception as close_e:
-                            logger.error(f"关闭扬声器流失败: {str(close_e)}")
-                    time.sleep(0.1)
-        except Exception as e:
-            logger.error(f"播放流初始化失败: {str(e)}")
-        finally:
-            # 关闭扬声器流
-            if self.spk_stream:
-                try:
-                    self.spk_stream.stop_stream()
-                    self.spk_stream.close()
-                    self.spk_stream = None
-                except Exception as e:
-                    logger.error(f"播放流关闭失败: {str(e)}")
-        logger.info('AudioService recv loop exited')
+                    # 恢复默认超时
+                    try:
+                        self.transport.set_timeout(1.0)
+                    except:
+                        pass
+
+                    tts_buffer = []
+                    self.device_manager.close_spk()
+                    self.wake_word_detector.reset()
+                    self._set_state(AudioState.IDLE)
+                elif self.state == AudioState.WAITING:
+                    # WAITING 状态下超时，继续等待
+                    logger.debug("等待服务器响应...")
+            except Exception as e:
+                logger.error(f"接收错误: {e}")
+                time.sleep(0.1)
+        
+        logger.info("接收线程退出")
+
+    # ========== 外部控制接口 ==========
+    
+    def force_idle(self):
+        """强制回到 IDLE 状态"""
+        logger.info("强制回到 IDLE 状态")
+        self.device_manager.close_spk()
+        self.recorder.clear()
+        self.wake_word_detector.reset()
+        self._set_state(AudioState.IDLE)
+        # 注意：不关闭麦克风，保持常开
+    
+    def is_in_conversation(self):
+        """是否在对话中"""
+        return self.state not in (AudioState.IDLE,)
+
+    def play_response(self, text):
+        """播放语音回复 (兼容旧接口)"""
+        logger.info(f"播放回复请求: {text}")

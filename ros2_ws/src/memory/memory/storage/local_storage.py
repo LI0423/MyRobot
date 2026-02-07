@@ -73,10 +73,22 @@ class LocalStorage:
             updated_at TEXT NOT NULL
         )
         ''')
+
+        # 创建提醒事项表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reminders (
+            reminder_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            data TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        ''')
         
         # 创建索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_preferences_user_id ON preferences(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_calendar_events_user_id ON calendar_events(user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_reminders_user_id ON reminders(user_id)')
         
         # 提交并关闭
         conn.commit()
@@ -348,6 +360,84 @@ class LocalStorage:
             conn.commit()
         finally:
             conn.close()
+
+    # 提醒事项相关方法
+    def save_reminder(self, reminder):
+        """
+        保存提醒事项
+
+        Args:
+            reminder (ReminderRecord): 提醒事项对象
+        """
+        data = reminder.to_dict()
+        encrypted_data = aes_encrypt(json.dumps(data))
+
+        conn, cursor = self._connect()
+
+        try:
+            cursor.execute('''
+            UPDATE reminders
+            SET data = ?, updated_at = ?
+            WHERE reminder_id = ?
+            ''', (encrypted_data, data['updated_at'], reminder.reminder_id))
+
+            if cursor.rowcount == 0:
+                cursor.execute('''
+                INSERT INTO reminders (reminder_id, user_id, data, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ''', (reminder.reminder_id, reminder.user_id, encrypted_data, data['created_at'], data['updated_at']))
+
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_reminders(self, user_id, status=None):
+        """
+        获取提醒事项
+
+        Args:
+            user_id (str): 用户ID
+            status (str, optional): 状态筛选
+
+        Returns:
+            list: 提醒事项数据列表
+        """
+        conn, cursor = self._connect()
+
+        try:
+            cursor.execute('''
+            SELECT data FROM reminders
+            WHERE user_id = ?
+            ORDER BY created_at
+            ''', (user_id,))
+
+            reminders = []
+            for row in cursor.fetchall():
+                encrypted_data = row[0]
+                decrypted_data = aes_decrypt(encrypted_data)
+                reminder_data = json.loads(decrypted_data)
+                if status and reminder_data.get('status') != status:
+                    continue
+                reminders.append(reminder_data)
+
+            return reminders
+        finally:
+            conn.close()
+
+    def delete_reminder(self, reminder_id):
+        """
+        删除提醒事项
+
+        Args:
+            reminder_id (str): 提醒事项ID
+        """
+        conn, cursor = self._connect()
+
+        try:
+            cursor.execute('DELETE FROM reminders WHERE reminder_id = ?', (reminder_id,))
+            conn.commit()
+        finally:
+            conn.close()
     
     # 其他方法
     def delete_all_data(self, user_id):
@@ -368,6 +458,9 @@ class LocalStorage:
             
             # 删除日历事件
             cursor.execute('DELETE FROM calendar_events WHERE user_id = ?', (user_id,))
+
+            # 删除提醒事项
+            cursor.execute('DELETE FROM reminders WHERE user_id = ?', (user_id,))
             
             conn.commit()
         finally:

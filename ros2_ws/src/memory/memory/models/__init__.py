@@ -11,9 +11,11 @@
 from .user_profile import UserProfile
 from .preference import Preference
 from .calendar import CalendarEvent
+from .reminder import ReminderRecord
 
 __all__ = [
     'UserProfile',
     'Preference',
-    'CalendarEvent'
+    'CalendarEvent',
+    'ReminderRecord'
 ]

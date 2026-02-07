@@ -1,0 +1,10 @@
+string id
+string type
+string data
+string status
+string due_time
+string repeat_rule
+string medicine
+string command
+string reason
+string contact

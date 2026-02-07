@@ -10,8 +10,9 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/msg', ['msg/Reminder.msg']),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'paho-mqtt'],
     zip_safe=True,
     maintainer='User',
     maintainer_email='user@example.com',
@@ -21,7 +22,15 @@ setup(
     entry_points={
         'console_scripts': [
             'schedule_reminder_node = life_assistance.schedule_reminder_node:main',
-            'health_monitoring_node = life_assistance.health_monitoring_node:main',
+            'mcp_bridge_node = life_assistance.mcp_bridge_node:main',
         ],
     },
+    message_extractors={
+        package_name: [
+            ('msg/*.msg', 'rosidl_generate_interfaces')
+        ]
+    },
+    buildtool_depend=['rosidl_default_generators'],
+    build_depend=['std_msgs'],
+    exec_depend=['std_msgs'],
 )

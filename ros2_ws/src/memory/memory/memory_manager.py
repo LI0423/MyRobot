@@ -14,6 +14,7 @@ from .storage.cloud_storage import CloudStorage
 from .models.user_profile import UserProfile
 from .models.preference import Preference
 from .models.calendar import CalendarEvent
+from .models.reminder import ReminderRecord
 
 class MemoryManager:
     """记忆库管理器类"""
@@ -206,6 +207,57 @@ class MemoryManager:
             events.append(CalendarEvent.from_dict(event_data))
         
         return events
+
+    # 提醒事项相关方法
+    def add_reminder(self, reminder):
+        """
+        添加提醒事项
+
+        Args:
+            reminder (ReminderRecord): 提醒事项对象
+        """
+        self.local_storage.save_reminder(reminder)
+        if self.cloud_storage:
+            self.cloud_storage.save_reminder(reminder)
+
+    def get_reminders(self, user_id, status=None):
+        """
+        获取提醒事项
+
+        Args:
+            user_id (str): 用户ID
+            status (str, optional): 状态筛选
+
+        Returns:
+            list: 提醒事项对象列表
+        """
+        reminders_data = self.local_storage.get_reminders(user_id, status)
+        reminders = []
+        for reminder_data in reminders_data:
+            reminders.append(ReminderRecord.from_dict(reminder_data))
+        return reminders
+
+    def update_reminder(self, reminder):
+        """
+        更新提醒事项
+
+        Args:
+            reminder (ReminderRecord): 提醒事项对象
+        """
+        self.local_storage.save_reminder(reminder)
+        if self.cloud_storage:
+            self.cloud_storage.save_reminder(reminder)
+
+    def delete_reminder(self, reminder_id):
+        """
+        删除提醒事项
+
+        Args:
+            reminder_id (str): 提醒事项ID
+        """
+        self.local_storage.delete_reminder(reminder_id)
+        if self.cloud_storage:
+            self.cloud_storage.delete_reminder(reminder_id)
     
     def update_calendar_event(self, event):
         """

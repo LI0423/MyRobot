@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/launch', ['launch/robot_launch.py']),
         ('share/' + package_name + '/launch', ['launch/emotion_launch.py']),
         ('share/' + package_name + '/launch', ['launch/vision_launch.py']),
+        ('share/' + package_name + '/launch', ['launch/xiaozhi.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

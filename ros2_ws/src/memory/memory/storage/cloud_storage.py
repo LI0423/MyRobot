@@ -180,6 +180,38 @@ class CloudStorage:
         """
         endpoint = f'calendar_events/{event_id}'
         return self._make_request(endpoint, 'DELETE')
+
+    # 提醒事项相关方法
+    def save_reminder(self, reminder):
+        """
+        保存提醒事项到云存储
+
+        Args:
+            reminder (ReminderRecord): 提醒事项对象
+        """
+        data = reminder.to_dict()
+        endpoint = f'reminders/{reminder.reminder_id}'
+        return self._make_request(endpoint, 'POST', data)
+
+    def get_reminders(self, user_id, status=None):
+        """
+        从云存储获取提醒事项
+
+        Args:
+            user_id (str): 用户ID
+            status (str, optional): 状态筛选
+        """
+        endpoint = f'reminders/{user_id}'
+        if status:
+            endpoint += f'?status={status}'
+        return self._make_request(endpoint)
+
+    def delete_reminder(self, reminder_id):
+        """
+        从云存储删除提醒事项
+        """
+        endpoint = f'reminders/{reminder_id}'
+        return self._make_request(endpoint, 'DELETE')
     
     # 同步方法
     def sync_all(self, local_storage, user_id):

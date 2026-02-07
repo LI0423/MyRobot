@@ -10,7 +10,7 @@
 import rclpy
 from rclpy.node import Node
 from voice_msgs.msg import VoiceCommand
-from std_msgs.msg import String
+from life_assistance.msg import Reminder
 import time
 from datetime import datetime
 
@@ -26,7 +26,7 @@ class AlarmTestNode(Node):
         
         # 订阅提醒消息
         self.reminder_subscriber = self.create_subscription(
-            String, 'schedule_reminder', self.reminder_callback, 10)
+            Reminder, 'schedule_reminder', self.reminder_callback, 10)
         
         # 测试结果
         self.test_results = []
