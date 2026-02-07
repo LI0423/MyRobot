@@ -1,0 +1,7 @@
+string method
+string params_json
+---
+bool success
+string result_json
+string error_code
+string error_message

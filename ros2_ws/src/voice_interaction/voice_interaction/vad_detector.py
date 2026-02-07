@@ -8,10 +8,17 @@ class VadEvent:
     START = 'start'  # 检测到语音开始
     END = 'end'      # 检测到语音结束
     NONE = 'none'    # 无语音状态变化
-    
+
+
+class VadState:
+    """VAD状态枚举，定义了VAD检测器的两种状态"""
+    IDLE = 'idle' # 空闲状态
+    SPEAKING = 'speaking' # 说话状态
+
+
 class VADDetector:
     """语音活动检测器，基于WebRTC VAD实现"""
-    def __init__(self, sample_rate=16000, frame_ms=20, mode=2, start_frames=10, end_silence_ms=1000, pre_roll_ms=300):
+    def __init__(self, sample_rate, frame_ms=20, mode=2, start_frames=10, end_silence_ms=1000, pre_roll_ms=300):
         """初始化VAD检测器
         
         Args:
@@ -29,17 +36,27 @@ class VADDetector:
         self.end_silence_ms = end_silence_ms  # 触发语音结束的静音时长
         self.pre_roll_frames = max(1, int(pre_roll_ms / frame_ms))  # 预滚缓冲区的帧数
         
-        self.state = 'idle'  # 当前状态：'idle'（空闲）或'speaking'（说话中）
+        self.state = VadState.IDLE  # 当前状态：'idle'（空闲）或'speaking'（说话中）
         self.speech_frame_count = 0  # 连续语音帧计数
         self.silence_ms = 0  # 连续静音时长（毫秒）
         self.pre_roll = collections.deque(maxlen=self.pre_roll_frames)  # 预滚缓冲区，存储最近的音频帧
         
     def reset(self):
-        """重置VAD检测器状态"""
-        self.state = 'idle'  # 重置为空闲状态
+        """重置VAD检测器状态（完全重置，包括预滚缓冲区）"""
+        self.state = VadState.IDLE  # 重置为空闲状态
         self.speech_frame_count = 0  # 重置连续语音帧计数
         self.silence_ms = 0  # 重置连续静音时长
         self.pre_roll.clear()  # 清空预滚缓冲区
+    
+    def soft_reset(self):
+        """软重置VAD检测器状态（保留预滚缓冲区）
+        
+        用于唤醒词检测后的场景，保留 pre_roll 以防止用户连续说话时丢失音频
+        """
+        self.state = VadState.IDLE  # 重置为空闲状态
+        self.speech_frame_count = 0  # 重置连续语音帧计数
+        self.silence_ms = 0  # 重置连续静音时长
+        # 保留 pre_roll 缓冲区，确保可以捕获用户立即开始说话的情况
         
     def feed(self, frame_bytes):
         """输入一帧PCM16LE格式的音频数据，进行VAD检测
@@ -73,14 +90,14 @@ class VADDetector:
         # 将当前帧添加到预滚缓冲区
         self.pre_roll.append(frame_bytes)
 
-        if self.state == 'idle':
+        if self.state == VadState.IDLE:
             # 空闲状态下的处理
             if is_speech:
                 # 检测到语音，增加连续语音帧计数
                 self.speech_frame_count += 1
                 if self.speech_frame_count >= self.start_frames:
                     # 连续语音帧达到阈值，切换到说话状态
-                    self.state = 'speaking'
+                    self.state = VadState.SPEAKING
                     self.silence_ms = 0
                     # 返回语音开始事件，预滚缓冲区保留供调用者使用
                     return VadEvent.START
@@ -89,7 +106,7 @@ class VADDetector:
                 self.speech_frame_count = 0
                 return VadEvent.NONE
 
-        elif self.state == 'speaking':
+        elif self.state == VadState.SPEAKING:
             # 说话状态下的处理
             if is_speech:
                 # 检测到语音，重置连续静音时长
@@ -99,7 +116,7 @@ class VADDetector:
                 self.silence_ms += self.frame_ms
                 if self.silence_ms >= self.end_silence_ms:
                     # 连续静音达到阈值，切换到空闲状态
-                    self.state = 'idle'
+                    self.state = VadState.IDLE
                     self.speech_frame_count = 0
                     self.silence_ms = 0
                     # 只有当静音时长达到阈值时，才返回语音结束事件

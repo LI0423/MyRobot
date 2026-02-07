@@ -2,70 +2,31 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-# 尝试导入语音消息类型，如果失败则使用String
-try:
-    from voice_msgs.msg import VoiceCommand
-    VOICE_MSGS_AVAILABLE = True
-except ImportError:
-    VOICE_MSGS_AVAILABLE = False
-    print("Warning: voice_msgs not found, VoiceCommand integration will be limited.")
-
 import threading
 import warnings
 import urllib3
 import logging
-import os
 import time
-import re
-from datetime import datetime
 
 from llm_node.mqtt_service import MQTTService
 from llm_node.audio_service import AudioService
 from dotenv import load_dotenv
 from llm_node.enums import MessageType
 from llm_node.config import Config
-
-# Get logger
-logger = logging.getLogger(__name__)
+from common.logging_config import setup_logging
+import json
 
 # 屏蔽警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # 屏蔽urllib3的不安全请求警告
 warnings.filterwarnings("ignore", category=DeprecationWarning)  # 屏蔽弃用警告
 
-# 配置详细日志
-logging.basicConfig(
-    level=logging.INFO,  # 提高日志级别为INFO，输出更详细的信息
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',  # 增加日志来源名称
-    handlers=[
-        logging.FileHandler('xiaozhi_node_vad.log', mode='w'),  # 日志文件
-        logging.StreamHandler()  # 同时输出到控制台
-    ]
-)
+# 配置统一的日志系统
+setup_logging(level=logging.INFO)
 
-# 为特定模块设置更详细的日志级别
-logging.getLogger('llm_node.mqtt_service').setLevel(logging.DEBUG)
-logging.getLogger('llm_node.audio_service').setLevel(logging.DEBUG)
+# Get logger
+logger = logging.getLogger(__name__)
 
 load_dotenv()  # 加载.env文件中的环境变量
-
-class ALSAErrorSuppressor:
-    """ALSA错误输出抑制器，防止音频库错误信息干扰用户界面
-    
-    注意：此类已在audio_service.py中定义，此处为重复定义
-    """
-
-    def __enter__(self):
-        """进入上下文管理器，将stderr重定向到/dev/null"""
-        self.old_stderr = os.dup(2)  # 保存原始stderr文件描述符
-        self.devnull = os.open('/dev/null', os.O_WRONLY)  # 打开/dev/null用于写入
-        os.dup2(self.devnull, 2)  # 将stderr重定向到/dev/null
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """退出上下文管理器，恢复原始stderr"""
-        os.dup2(self.old_stderr, 2)  # 恢复原始stderr
-        os.close(self.old_stderr)  # 关闭保存的文件描述符
-        os.close(self.devnull)  # 关闭/dev/null文件描述符
 
 
 class XiaoZhiNode(Node):
@@ -78,9 +39,6 @@ class XiaoZhiNode(Node):
 
         # 初始化配置
         self.config = Config()
-        
-        # 初始化ROS发布者
-        self._init_publishers()
         
         # 初始化MQTT服务
         logger.debug("正在初始化MQTT服务...")
@@ -96,6 +54,34 @@ class XiaoZhiNode(Node):
                                          on_wake_word_detected=self._on_wake_word_detected)
         logger.info("音频服务初始化完成")
         
+        # 创建视觉事件订阅者 (订阅独立的 vision_node 发布的 Topic)
+        self.vision_sub = None
+        self.vision_mode_pub = None
+        if self.config.vision_enabled:
+            logger.debug("创建视觉事件订阅者...")
+            self.vision_sub = self.create_subscription(
+                String,
+                '/vision/face_detected',
+                self._on_vision_face_detected,
+                10
+            )
+            logger.info("已订阅 /vision/face_detected Topic")
+            
+            # 创建视觉模式发布者
+            self.vision_mode_pub = self.create_publisher(String, '/vision/set_mode', 10)
+            logger.info("创建发布者: /vision/set_mode")
+        else:
+            logger.info("视觉功能已禁用")
+        
+        # 游戏相关 Topics
+        self.game_start_pub = self.create_publisher(String, '/game/rps/start', 10)
+        self.game_confirm_pub = self.create_publisher(String, '/game/rps/confirm', 10)
+        self.game_state_sub = self.create_subscription(
+            String, '/game/rps/state', self._on_game_state, 10)
+        self.game_result_sub = self.create_subscription(
+            String, '/game/rps/result', self._on_game_result, 10)
+        logger.info("游戏 Topics 已初始化")
+        
         # 启动MQTT和音频服务的线程
         logger.debug("正在启动服务线程...")
         threading.Thread(target=self._start_mqtt_and_audio, daemon=True, name="service_start_thread").start()
@@ -106,22 +92,8 @@ class XiaoZhiNode(Node):
         self.session_id = None  # 会话ID
         self.lock = threading.Lock()  # 线程锁
         self.last_listen_stop_time = None  # 上次监听停止时间
+        self.in_game = False  # 是否在游戏中
         logger.info("小智节点初始化完成")
-
-    def _init_publishers(self):
-        """初始化ROS发布者"""
-        # 家居控制命令发布者
-        self.home_control_pub = self.create_publisher(
-            String, 'home_control_command', 10)
-        
-        # 语音指令发布者 (用于生活辅助等)
-        if VOICE_MSGS_AVAILABLE:
-            self.voice_command_pub = self.create_publisher(
-                VoiceCommand, 'voice_command', 10)
-        else:
-            self.voice_command_pub = None
-            
-        logger.info("ROS发布者初始化完成")
         
     def _start_mqtt_and_audio(self):
         """启动MQTT和音频服务"""
@@ -139,10 +111,12 @@ class XiaoZhiNode(Node):
         except Exception as e:
             logger.exception('MQTT服务启动失败')
         
-        # 启动音频服务
         logger.debug("正在启动音频服务...")
         self.audio_service.start()
         logger.info("音频服务启动完成")
+        
+        # 视觉服务现在是独立节点，无需在此启动
+        logger.info("注意: 视觉服务是独立节点，请确保 vision_node 已启动")
 
     def _on_mqtt_message(self, topic, message, raw_msg):
         """MQTT消息回调函数
@@ -253,7 +227,7 @@ class XiaoZhiNode(Node):
                     "format": "opus",
                     "sample_rate": self.config.sample_rate,
                     "channels": 1,
-                    "frame_duration": 60
+                    "frame_duration": self.config.frame_duration
                 },
                 "udp": self.audio_service.udp_info,
                 "session_id": None  # 初始会话ID为空，由服务器分配
@@ -277,7 +251,8 @@ class XiaoZhiNode(Node):
             listen_msg = {
                 "type": "listen",
                 "state": state,
-                "session_id": self.session_id
+                "session_id": self.session_id,
+                "mode": "manual"
             }
             
             # 通过MQTT发送LISTEN消息
@@ -296,7 +271,7 @@ class XiaoZhiNode(Node):
         stt_text = message.get('text', '')
         if stt_text:
             logger.info(f'STT识别结果: {stt_text}')
-            print(f"👂 用户: {stt_text}")
+            print(f"用户: {stt_text}")
         else:
             logger.warning('STT结果为空')
         logger.info('STT消息处理完成')
@@ -312,185 +287,9 @@ class XiaoZhiNode(Node):
         if llm_text and llm_text != self.last_printed_text:
             logger.info(f'LLM回复: {llm_text}')
             self.last_printed_text = llm_text
-            
-            # 解析并执行指令
-            self.parse_and_execute_command(llm_text)
         else:
             logger.debug('LLM文本与上次相同，跳过更新')
         logger.info('LLM消息处理完成')
-        
-    def _init_publishers(self):
-        # Home control command publisher
-        self.home_control_pub = self.create_publisher(
-            String, 'home_control_command', 10)
-        
-        # Voice command publisher (for life assistance, etc.)
-        if VOICE_MSGS_AVAILABLE:
-            self.voice_command_pub = self.create_publisher(
-                VoiceCommand, 'voice_command', 10)
-        else:
-            self.voice_command_pub = None
-
-        # [NEW] Motion Control Publisher
-        self.motion_pub = self.create_publisher(
-            String, 'motion_command', 10)
-
-        # [NEW] System Control Publisher
-        self.system_pub = self.create_publisher(
-            String, 'system_command', 10)
-
-        # [NEW] Media Control Publisher
-        self.media_pub = self.create_publisher(
-            String, 'media_command', 10)
-            
-        logger.info("ROS发布者初始化完成")
-
-    def parse_and_execute_command(self, text):
-        """解析并执行指令"""
-        if not text:
-            return
-
-        # 1. 尝试解析 [INTENT:ID:SLOTS] 格式 (新标准)
-        # Regex to match [INTENT:ID:SLOTS]
-        # ID might contain underscores, e.g. SAFETY_STOP
-        intent_matches = re.findall(r'\[INTENT:([A-Za-z0-9_]+):?(.*?)\]', text)
-        if intent_matches:
-            for intent_id, slots in intent_matches:
-                self._execute_intent(intent_id, slots)
-            return
-
-        # 2. 尝试解析 [CMD:domain:action:params] 格式 (旧标准, 兼容)
-        matches = re.findall(r'\[CMD:(.*?)\]', text)
-        for match in matches:
-            try:
-                logger.info(f"解析到指令: {match}")
-                parts = match.split(':')
-                if len(parts) >= 2:
-                    domain = parts[0]
-                    action = parts[1]
-                    params = ':'.join(parts[2:]) if len(parts) > 2 else ""
-                    
-                    if domain == "home":
-                        self._execute_home_command(action, params)
-                    elif domain == "life":
-                        self._execute_life_command(action, params)
-                    else:
-                        logger.warning(f"未知指令域: {domain}")
-            except Exception as e:
-                logger.error(f"指令执行失败: {match}, 错误: {e}")
-
-    def _execute_intent(self, intent_id, slots):
-        """执行意图指令"""
-        logger.info(f"执行意图: {intent_id}, 槽位: {slots}")
-        
-        # 紧急安全
-        if intent_id.startswith("SAFETY_"):
-            if intent_id == "SAFETY_SOS":
-                # 同时触发本地报警和Life Assistance的SOS流程
-                self._execute_life_command("sos", "")
-            else:
-                self.motion_pub.publish(String(data=intent_id))
-        
-        # 运动控制
-        elif intent_id.startswith("MOVE_"):
-            self.motion_pub.publish(String(data=intent_id))
-            
-        # 音量/媒体
-        elif intent_id.startswith("VOL_") or intent_id.startswith("MEDIA_"):
-            # 将槽位与ID组合发送，如 VOL_UP:20
-            command_data = f"{intent_id}:{slots}" if slots else intent_id
-            self.media_pub.publish(String(data=command_data))
-            
-        # 工具助手 (Time/Date 直接本地回复)
-        elif intent_id == "TIME_QUERY":
-            now_time = datetime.now().strftime("%p %I点%M分").replace("AM", "上午").replace("PM", "下午")
-            self.mqtt_service.publish_tts(f"现在是{now_time}")
-            
-        elif intent_id == "DATE_QUERY":
-            weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-            now = datetime.now()
-            date_str = now.strftime("%m月%d日")
-            weekday = weekdays[now.weekday()]
-            self.mqtt_service.publish_tts(f"今天是{date_str}，{weekday}")
-            
-        elif intent_id == "ALARM_STOP":
-            # 发送给 Life Assistance
-            if self.voice_command_pub:
-                 msg = VoiceCommand()
-                 msg.command = "ALARM_STOP"
-                 msg.language = "cmd"
-                 msg.confidence = 1.0
-                 self.voice_command_pub.publish(msg)
-
-        # 系统控制
-        elif intent_id.startswith("SYS_") or intent_id == "NET_CONFIG":
-            self.system_pub.publish(String(data=intent_id))
-            
-        else:
-            logger.warning(f"未处理的意图: {intent_id}")
-
-    def _execute_home_command(self, action, params):
-        """执行家居控制指令"""
-        # 构造 control_device:<device_id>:<command>:<value> 格式
-        # 假设 params 格式为 device_id:value 或者只是 device_id (默认 value)
-        
-        device_id = ""
-        value = "default"
-        
-        # 简单解析 params
-        param_parts = params.split(':')
-        if len(param_parts) >= 1:
-            device_id = param_parts[0]
-        if len(param_parts) >= 2:
-            value = param_parts[1]
-            
-        command_str = f"control_device:{device_id}:{action}:{value}"
-        
-        msg = String()
-        msg.data = command_str
-        self.home_control_pub.publish(msg)
-        logger.info(f"已发布家居控制指令: {command_str}")
-
-    def _execute_life_command(self, action, params):
-        """执行生活辅助指令"""
-        if not self.voice_command_pub:
-            logger.warning("VoiceCommand publisher unavailable")
-            return
-
-        final_command = params
-        
-        # 1. 设置用药提醒
-        if action == "set_medication":
-            # format: set_medication:0800:降压药
-            # params 可能是 0800:降压药
-            final_command = f"set_medication:{params}"
-            
-        # 2. 触发SOS
-        elif action == "sos":
-            final_command = "触发SOS"
-            
-        # 3. 设置闹钟 (兼容旧逻辑)
-        elif action == "set_alarm":
-             if "tomorrow" in params:
-                 time_part = params.replace("tomorrow_", "")
-                 if len(time_part) == 4:
-                     hour = time_part[0:2]
-                     minute = time_part[2:4]
-                     final_command = f"明天{hour}点{minute}分设置闹钟"
-             elif "today" in params:
-                 time_part = params.replace("today_", "")
-                 if len(time_part) == 4:
-                     hour = time_part[0:2]
-                     minute = time_part[2:4]
-                     final_command = f"{hour}点{minute}分设置闹钟"
-        
-        msg = VoiceCommand()
-        msg.command = final_command
-        msg.language = "zh-CN"
-        msg.confidence = 1.0  # LLM生成的指令置信度设为最高
-        
-        self.voice_command_pub.publish(msg)
-        logger.info(f"已发布语音指令: {final_command}")
             
     def handle_goodbye_message(self, message):
         """处理GOODBYE消息，用于结束会话
@@ -508,9 +307,12 @@ class XiaoZhiNode(Node):
             if message_session_id == self.session_id:
                 logger.info(f'结束会话，会话ID: {self.session_id}')
                 self.session_id = None  # 重置会话ID
-                logger.debug('正在停止音频服务...')
-                self.audio_service.stop()  # 停止音频服务
-                logger.info('音频服务已停止')
+                
+                # 重置音频服务回到 IDLE 状态，而不是停止
+                # 这样可以继续监听唤醒词
+                logger.debug('重置音频服务到 IDLE 状态...')
+                self.audio_service.force_idle()
+                logger.info('音频服务已重置，继续监听唤醒词')
             else:
                 logger.warning(f'会话ID不匹配，忽略GOODBYE消息')
         
@@ -532,6 +334,9 @@ class XiaoZhiNode(Node):
             
         # 发送LISTEN start消息，通知服务器开始录音
         self.send_listen_message("start")
+        
+        # 切换视觉为高频模式
+        self._set_vision_mode('high')
     
     def _on_listen_stop(self):
         """监听停止回调"""
@@ -544,11 +349,158 @@ class XiaoZhiNode(Node):
         # 记录上次监听停止时间，用于会话超时检查
         self.last_listen_stop_time = time.time()
         logger.debug(f'更新上次监听停止时间: {self.last_listen_stop_time}')
+        
+        # 切换视觉为低频模式
+        self._set_vision_mode('low')
     
     def _on_wake_word_detected(self):
-        """唤醒词检测回调"""
-        logger.info("🎉 检测到唤醒词'小智'，开始正常音频处理")
-        print("👋 你好！我是小智，请问有什么可以帮助你的？")
+        """唤醒词检测回调
+        
+        当检测到唤醒词时:
+        1. 如果没有会话，发送 HELLO 消息建立会话
+        2. 切换视觉为高频模式
+        """
+        logger.info(f"检测到唤醒词'{self.config.wake_word}'，开始建立会话")
+        logger.info(f"你好！我是{self.config.wake_word}，请问有什么可以帮助你的？")
+        
+        # 检查会话ID，如果没有会话就建立
+        if not self.session_id:
+            logger.info("连接会话…")
+            logger.info("会话ID为空，发送HELLO消息建立会话")
+            self.send_hello_message()
+        else:
+            logger.info(f"会话已存在，会话ID: {self.session_id}")
+        
+        # 唤醒时切换视觉为高频模式
+        self._set_vision_mode('high')
+    
+    def _set_vision_mode(self, mode):
+        """设置视觉检测模式
+        
+        Args:
+            mode (str): 'high' 或 'low'
+        """
+        if self.vision_mode_pub:
+            msg = String()
+            msg.data = mode
+            self.vision_mode_pub.publish(msg)
+            logger.debug(f"发布视觉模式: {mode}")
+    
+    def _on_vision_face_detected(self, msg):
+        """视觉人脸检测消息回调
+        
+        处理来自 vision_node 的人脸检测事件。
+        
+        Args:
+            msg (String): ROS 2 消息，data 字段为 JSON 格式
+        """
+        try:
+            face_data = json.loads(msg.data)
+            face_count = face_data.get('face_count', 0)
+            
+            if face_count == 0:
+                return
+            
+            logger.info(f"收到视觉事件: 检测到 {face_count} 个人脸")
+            
+            # 根据检测到的人脸数量生成问候语
+            if face_count == 1:
+                greeting = f"你好！我是{self.config.wake_word}，很高兴见到你！"
+            else:
+                greeting = f"你好！我是{self.config.wake_word}，欢迎大家！"
+            
+            print(greeting)
+            
+            # 触发语音问候
+            if self.audio_service:
+                self.audio_service.play_response(greeting)
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"解析视觉消息失败: {e}")
+        except Exception as e:
+            logger.error(f"处理视觉消息异常: {e}")
+    
+    # ==================== 游戏相关方法 ====================
+    
+    def start_rps_game(self):
+        """启动猜拳游戏"""
+        logger.info("启动猜拳游戏")
+        self.in_game = True
+        
+        msg = String()
+        msg.data = 'start'
+        self.game_start_pub.publish(msg)
+    
+    def send_game_confirm(self, confirm_text):
+        """发送游戏确认
+        
+        Args:
+            confirm_text (str): 确认文本
+        """
+        if not self.in_game:
+            return
+        
+        msg = String()
+        msg.data = confirm_text
+        self.game_confirm_pub.publish(msg)
+    
+    def _on_game_state(self, msg):
+        """处理游戏状态变化
+        
+        Args:
+            msg (String): JSON 格式状态消息
+        """
+        try:
+            data = json.loads(msg.data)
+            state = data.get('state')
+            message = data.get('message', '')
+            
+            logger.info(f"游戏状态: {state}, 消息: {message}")
+            
+            # 播报消息
+            if message and self.audio_service:
+                print(f"[游戏] {message}")
+                self.audio_service.play_response(message)
+                
+        except Exception as e:
+            logger.error(f"处理游戏状态异常: {e}")
+    
+    def _on_game_result(self, msg):
+        """处理游戏结果
+        
+        Args:
+            msg (String): JSON 格式结果消息
+        """
+        try:
+            data = json.loads(msg.data)
+            result = data.get('result')
+            message = data.get('message', '')
+            
+            logger.info(f"游戏结果: {result}")
+            
+            # 播报结果
+            if message:
+                print(f"[游戏] {message}")
+                if self.audio_service:
+                    self.audio_service.play_response(message)
+            
+            # 游戏结束
+            self.in_game = False
+            
+        except Exception as e:
+            logger.error(f"处理游戏结果异常: {e}")
+    
+    def check_game_intent(self, text):
+        """检查文本中是否包含游戏意图
+        
+        Args:
+            text (str): 用户输入文本
+            
+        Returns:
+            bool: 是否包含游戏意图
+        """
+        game_keywords = ['猜拳', '石头剪刀布', '玩游戏', '剪刀石头布']
+        return any(keyword in text for keyword in game_keywords)
 
 
 def main(args=None):
